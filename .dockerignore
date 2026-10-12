@@ -1,0 +1,4 @@
+# Build context of examples/self-hosted: only the built plugin
+*
+!dist/draw.hmi
+!examples/self-hosted/entrypoint.sh

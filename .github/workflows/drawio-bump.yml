@@ -1,0 +1,73 @@
+# Weekly: pins the latest draw.io release when it is newer than
+# upstream/drawio.json, runs the tests against it and opens a pull request
+# with the results (also when tests fail, so the breakage is visible).
+name: draw.io release check
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: draw.io version (default the latest release)
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm ci
+        working-directory: tools/dev
+      - name: Pin the release
+        id: bump
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          version=$(node scripts/bump-drawio.mjs ${{ inputs.version }})
+          status=$?
+          set -e
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ $status -eq 2 ]; then echo "changed=false" >> "$GITHUB_OUTPUT"; elif [ $status -eq 0 ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else exit $status; fi
+      - if: steps.bump.outputs.changed == 'true'
+        run: npm run build:webapp && npx playwright install --with-deps chromium
+      - if: steps.bump.outputs.changed == 'true'
+        id: tests
+        run: |
+          set +e
+          npm run test:contract > contract.log 2>&1; contract=$?
+          npm run test:e2e > e2e.log 2>&1; e2e=$?
+          {
+            echo 'summary<<EOF'
+            echo "- Contract tests: $([ $contract -eq 0 ] && echo passed || echo '**failed**')"
+            echo "- End-to-end tests: $([ $e2e -eq 0 ] && echo passed || echo '**failed**')"
+            echo
+            echo '```'
+            grep -E '^# (tests|pass|fail)|^not ok' contract.log e2e.log | head -40
+            echo '```'
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+          rm contract.log e2e.log
+      - if: steps.bump.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: drawio-${{ steps.bump.outputs.version }}
+          commit-message: Pin draw.io ${{ steps.bump.outputs.version }}
+          title: Pin draw.io ${{ steps.bump.outputs.version }}
+          add-paths: upstream/drawio.json
+          body: |
+            draw.io ${{ steps.bump.outputs.version }} was released. Test results against it:
+
+            ${{ steps.tests.outputs.summary }}
+
+            A failing contract test names a draw.io function the plugin wraps that changed (see `Hmi.Compat.TARGETS` in `src/compat/HmiCompat.js`).

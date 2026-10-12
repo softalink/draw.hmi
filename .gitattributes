@@ -1,0 +1,2 @@
+# Third-party minified libraries
+src/lib/*.min.js linguist-vendored -diff

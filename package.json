@@ -1,0 +1,24 @@
+{
+  "name": "draw.hmi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HMI/SCADA editor and runtime for draw.io (self-hosted and Desktop) and Grafana",
+  "license": "Apache-2.0",
+  "repository": "github:softalink/draw.hmi",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "fetch-drawio": "node scripts/fetch-drawio.mjs",
+    "build": "node scripts/build.mjs",
+    "build:webapp": "node scripts/build.mjs --webapp",
+    "test": "cd test/unit && node --test --test-concurrency=1",
+    "test:contract": "node --test --test-concurrency=1 test/contract/*.test.js",
+    "test:e2e": "node scripts/run-e2e.mjs",
+    "dev:servers": "cd tools/dev && node server.js"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10",
+    "playwright": "1.56.1"
+  }
+}

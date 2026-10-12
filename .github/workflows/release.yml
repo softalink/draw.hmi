@@ -1,0 +1,62 @@
+# On a version tag (v1.2.3): tests, then a GitHub release with
+#   draw.hmi-<version>.zip                   the draw.io plugin (plugins/draw.hmi)
+#   softalink-hmi-panel-<version>.zip        the Grafana panel
+#   softalink-hmieditor-app-<version>.zip    the Grafana editor app
+# The Grafana plugins are signed when the GRAFANA_ACCESS_POLICY_TOKEN secret
+# is set (https://grafana.com/developers/plugin-tools/publish-a-plugin/sign-a-plugin).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            grafana/panel/package-lock.json
+      - name: Check the version
+        run: |
+          version=$(node -p "require('./package.json').version")
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "package.json has $version, tag is $GITHUB_REF_NAME"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm ci
+        working-directory: grafana/panel
+      - run: npm run build
+        working-directory: grafana
+      - name: Sign the Grafana plugins
+        env:
+          GRAFANA_ACCESS_POLICY_TOKEN: ${{ secrets.GRAFANA_ACCESS_POLICY_TOKEN }}
+        if: env.GRAFANA_ACCESS_POLICY_TOKEN != ''
+        run: |
+          npx --yes @grafana/sign-plugin@latest --distDir grafana/panel/dist
+          npx --yes @grafana/sign-plugin@latest --distDir grafana/editor-app/dist
+      - name: Package
+        run: |
+          mkdir -p release
+          (cd dist && zip -qr ../release/draw.hmi-$VERSION.zip draw.hmi)
+          cp -r grafana/panel/dist release/softalink-hmi-panel
+          cp -r grafana/editor-app/dist release/softalink-hmieditor-app
+          (cd release && zip -qr softalink-hmi-panel-$VERSION.zip softalink-hmi-panel && zip -qr softalink-hmieditor-app-$VERSION.zip softalink-hmieditor-app)
+          (cd release && sha256sum *.zip > SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*.zip
+            release/SHA256SUMS

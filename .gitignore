@@ -1,0 +1,11 @@
+node_modules/
+.cache/
+dist/
+grafana/**/node_modules/
+grafana/**/dist/
+test-results/
+playwright-report/
+*.log
+grafana/panel/playwright/.auth/
+grafana/panel/.eslintcache
+.DS_Store

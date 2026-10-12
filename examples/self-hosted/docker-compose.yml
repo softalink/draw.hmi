@@ -1,0 +1,31 @@
+# draw.io with draw.hmi on http://localhost:8080/?p=hmi (the plugin also
+# loads without ?p=hmi while DRAWIO_HMI_AUTOLOAD is true).
+#   npm run build                      # in the repository root
+#   docker compose -f examples/self-hosted/docker-compose.yml up --build
+services:
+  drawio:
+    build:
+      context: ../..
+      dockerfile: examples/self-hosted/Dockerfile
+      args:
+        DRAWIO_VERSION: ${DRAWIO_VERSION:-32.4.1}
+    ports:
+      - ${DRAWIO_PORT:-8080}:8080
+    environment:
+      DRAWIO_HMI_AUTOLOAD: 'true'
+      # The image's default content security policy blocks what HMI screens
+      # need: live data (connect-src: WebSocket, MQTT over WebSocket, HTTP
+      # polling and SSE to your servers) and object scripts, which run in
+      # Blob workers (worker-src blob:). Narrow connect-src to your servers.
+      # The value goes into a JavaScript string in js/PreConfig.js, so its
+      # quotes are escaped (\'self\').
+      DRAWIO_CSP_HEADER: >-
+        default-src \'self\';
+        script-src \'self\' \'unsafe-inline\';
+        worker-src \'self\' blob:;
+        connect-src \'self\' ws: wss: http: https:;
+        img-src * data: blob:;
+        media-src * data: blob:;
+        font-src * about:;
+        style-src \'self\' \'unsafe-inline\' https://fonts.googleapis.com;
+        frame-src \'self\' http: https:;

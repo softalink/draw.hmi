@@ -1,0 +1,822 @@
+# draw.io HMI / SCADA — User Guide
+
+This guide covers draw.hmi, the HMI/SCADA plugin for draw.io: building operator screens ("screen design") and running them ("operation"). It documents only what is implemented in this repository; for the requirements it implements, see [SRS.md](SRS.md), and for the internal schemas and module contracts, see [ARCHITECTURE.md](ARCHITECTURE.md).
+
+Audience:
+- **Screen designers** (engineers/integrators) — read sections 1–11, 15–17.
+- **Operators** — read sections 1, 13, and the parts of 6/12 about the Tag Browser and alarms.
+
+---
+
+## 1. Overview & safety notice
+
+draw.io HMI adds, on top of the standard draw.io editor:
+
+- **Data sources** — MQTT (over WebSocket), WebSocket, HTTP polling and Server-Sent Events connections, configured per document.
+- **Tags** — a document-level catalogue of named data points, fed from sources or from a built-in simulator.
+- **Bindings** — rules that map a tag (or an expression) to a shape's label, style, geometry, visibility or widget property.
+- **Events & actions** — click/hover/value-change handlers that run actions such as writing a tag, navigating, opening a dialog or animating.
+- **Triggers & state machines** — condition-driven rules, the basis for alarm visualisation and other state-dependent appearance.
+- **Animations** — blink/pulse/spin/shake/colour-cycle/fade presets, keyframe sequences, and edge flow animation.
+- **A widget library** — gauges, tanks, indicators, switches, sliders, buttons, charts, tables, equipment symbols and pipes (`mxgraph.hmi.*` shapes).
+- **A runtime mode** — a locked, chromeless operator view separate from the editor, where data flows and events fire.
+- **A simulator** — mock tag values, for designing and testing without live equipment.
+
+> **Safety notice.** draw.io HMI is a supervisory **visualisation** tool. It is **not** intended for safety-critical or real-time control. Write actions must be protected by authorisation and interlocks in the control system and gateway, never only in the screen. The editor shows this notice (a confirm dialog, remembered per browser) before the first Live Preview or Run in a session; you can suppress it deployment-wide with `DRAWIO_CONFIG.hmi.hideSafetyNotice = true`.
+
+Runtime state (tag values, animation state, live styling) is applied through an **overlay** and is never written into the diagram file — see §4.
+
+---
+
+## 2. Enabling the plugin
+
+The HMI plugin is off by default and must be explicitly enabled. Install the plugin's files (`npm install && npm run build` writes them to `dist/draw.hmi/`) as `plugins/draw.hmi/` of a self-hosted draw.io, and add the loader snippet `plugins/draw.hmi/preconfig.js` (`src/entry/preconfig.js`) to `js/PreConfig.js`. draw.io itself is not modified. `npm run build:webapp` assembles such a draw.io in `dist/webapp/`. The plugin then loads when any of the following are true:
+
+| Mechanism | How |
+|---|---|
+| URL parameter | `?p=hmi` (load it like any other plugin), or any `?hmi=...` parameter (e.g. `?hmi=run`) |
+| Deployment config | `window.DRAWIO_CONFIG.hmi` is set to any object (even `{}`) in your `js/PreConfig.js` or Docker config, or `window.DRAWIO_HMI_AUTOLOAD = true` |
+| Plugins dialog | *Extras → Edit Diagram* is unrelated; instead use *Extras → Plugins…* and add `hmi` (mapped through `App.pluginRegistry`) the same way as any other bundled plugin, when `?p=` handling is exposed by your deployment |
+
+The plugin always loads as the single bundle `plugins/draw.hmi/hmi-plugin.js`.
+
+Once enabled, a new **Extras → HMI / SCADA** submenu appears (see §3), and selecting a cell adds an **HMI** tab to the Format panel (§7–10).
+
+### Self-hosting note
+
+**app.diagrams.net (the public draw.io instance) does not support live HMI data.** Its Content-Security-Policy `connect-src` does not allow arbitrary WebSocket/HTTP endpoints, so MQTT/WS/HTTP/SSE sources cannot connect there. Live data, Live Preview, Run Screen and the simulator's connections all require a **self-hosted deployment** of draw.io with the plugin installed in `plugins/draw.hmi/` (for example `dist/webapp`, or a draw.io Docker image) where you control the CSP `connect-src` and, optionally, `DRAWIO_CONFIG.hmi.allowedEndpoints` (see [HARDENING.md](HARDENING.md)). Editing HMI screens (bindings, tags, widgets) works anywhere the plugin loads; only *connecting to live data* is restricted.
+
+---
+
+## 3. Quick start (5 minutes)
+
+1. **Start a screen.** *File → New*, then pick one of the four **HMI / SCADA** templates (search `hmi` or `scada` in the New dialog — Water Treatment Plant, Tank Farm, Motor Control Center, Building HVAC; see §11 templates catalogue) or start from a blank page and drag a **Tank** shape onto the canvas from the **HMI / Displays** sidebar palette (*More Shapes → HMI / SCADA*, or search `tank`).
+2. **Add a simulated tag.** *Extras → HMI / SCADA → Screen Settings…* → **Tags** tab → **Add Tag**. Give it a name (e.g. `Tank1.Level`), type `number`, and under **Simulation** pick kind `sine`, min `10`, max `90`, period `20000` (ms). Click OK in the tag editor, then OK to close Screen Settings.
+3. **Bind the tank to the tag.** Select the tank shape. Either:
+   - click **Animation Links…** in the Format panel's **HMI** tab, tick *Percent Fill* (Display tab) or add a binding (*Bindings*, same tab) and enter `Tank1.Level`, or
+   - open the **Tag Browser** (*Extras → HMI / SCADA → Tag Browser…*) and drag `Tank1.Level` onto the tank — dropping onto a tank/cylinder shape auto-creates a `style:hmiLevel` binding.
+4. **Preview it.** Choose *Extras → HMI / SCADA → Live Preview*. The tank should start filling and draining on a 20-second sine wave. Toggle **Interactive** in the same menu if you also want click/event handlers to fire while still editing.
+5. **Run it.** Choose *Extras → HMI / SCADA → Run Screen* to open the locked operator view (`plugins/draw.hmi/hmi-run.html`) in a new tab or window. It has no editing and no sidebar: just the running screen, page navigation and a status bar (§13).
+
+---
+
+## 4. Concepts
+
+| Concept | Summary |
+|---|---|
+| **Data source** | A configured connection (MQTT/WS/HTTP/SSE/host) that produces tag values and, optionally, accepts writes. Document- or page-scoped. §5. |
+| **Tag** | A named data point with a current value, quality (`good`/`bad`/`uncertain`/`stale`) and timestamp, held only in memory. §6. |
+| **Binding** | A rule on a cell mapping a tag (or an expression) to a property: label, style key, geometry offset, visibility, tooltip or widget property. §7. |
+| **Event / action** | A handler on a cell (click, value change, hover, page open/close, a named message) that runs one or more actions (write a tag, navigate, open a dialog, animate, run a script, …). §8. |
+| **Trigger** | A condition-and-action rule, or a multi-state machine, evaluated whenever a referenced tag changes. The basis for alarm colouring and other state-driven appearance. §9. |
+| **Animation** | A named, cell-level animation (a built-in preset or a keyframe sequence) started by triggers, events, or auto-play. §10. |
+| **Alarm** | A tag-level limit (`hihi`/`hi`/`lo`/`lolo`, or a boolean alarm value) tracked in a session-local alarm list with acknowledgement. §12. |
+| **Runtime vs. edit mode** | Edit mode is the ordinary draw.io editor (nothing runs unless Live Preview is on). Runtime mode (Run Screen, `?hmi=run`, or an embed) is a locked, chromeless view where sources connect, bindings/triggers/events/animations are all live. §13. |
+| **Isolation** | Runtime values are held in a per-cell **overlay** (a map of transient style/label/property changes), never in the `mxGraphModel`. No runtime code path calls `model.setValue`/`setStyle`/`setGeometry` or opens an undoable edit; stopping the runtime restores every cell to its exact design-time appearance and the file's modified flag is untouched. |
+
+---
+
+## 5. Data sources
+
+Manage sources in *Extras → HMI / SCADA → Screen Settings…*, **Data Sources** tab (*Data Sources…* opens it directly). Each source has a name, protocol type, an enabled flag, a scope (`file` — connects once regardless of page; or `page` — connects/disconnects with the page that references it), and an optional tag-name **prefix** (e.g. `plant1/`) prepended to every tag it produces.
+
+Connections open **only** in runtime mode or while Live Preview is on; they close when you leave that mode, close the file, or unload the page. Untrusted files never auto-connect just from being opened.
+
+### Protocol settings
+
+| Type | Settings |
+|---|---|
+| `mqtt` | Broker URL (`ws://`/`wss://`), client ID, keep-alive, MQTT protocol version, clean session, subscribed topic filters (comma-separated, wildcards `+`/`#` supported) |
+| `ws` | URL, an optional message sent right after connect (subscription handshake) |
+| `http` | Method (GET/POST/PUT), poll interval (ms, minimum enforced at 250 by the SRS; the dialog defaults to 1000), request body, headers. Overlapping polls are prevented — a new request is not issued while one is outstanding |
+| `sse` | URL, event names to listen for (default `message`) |
+| `host` | No connection settings — values arrive only through the embed postMessage API (§14); used when draw.io is embedded in a host page that pushes data in |
+
+### Payload formats
+
+Set under **Format** in the source editor (`format.kind`):
+
+| Kind | Example | Resulting update |
+|---|---|---|
+| `flat` | `{"Tank1/Level": 42.1, "Pump1/Run": true}` | Each key is a tag name |
+| `array` | `[{"tag": "Tank1/Level", "value": 42.1, "ts": ..., "quality": "good"}]` | One update per item (`id`/`dataId` are accepted aliases of `tag`) |
+| `topic` | MQTT topic `plant/Tank1/Level`, payload `42.1` | With template `plant/{tag}`, the tag name is extracted from the topic |
+| `jsonpath` | A list of `{tag, path}` pairs evaluated against the payload | One update per configured path |
+| `drawio-update-xml` | `<updates><update id="cell1" value="…"/></updates>` | Compatibility with the legacy `plugins/update.js` protocol |
+| `auto` (default) | any of the above | Format detected from the message shape |
+
+A source may also define a **parser script** (`(message, context) → updates | false`, dropped if it returns `false`) and a **pre-connect script** that can rewrite the URL/headers/credentials before connecting — both subject to the script policy (§16, §17).
+
+### Credentials
+
+Per source, a **Credentials mode**:
+
+| Mode | Behaviour |
+|---|---|
+| `none` | No credentials sent |
+| `save` | Username/password stored in the source config (and therefore in the file) — the dialog shows a warning in red |
+| `prompt` | The operator is asked once per runtime session (`Hmi.CredentialsDialog`), cached for that session only |
+| `param` | Looked up at runtime from `${paramName}` (screen variables, URL parameters, `localStorage`, or `DRAWIO_CONFIG.hmi.params`) |
+
+### Test connection
+
+Each source row has a **Test Connection** button: it spins up a temporary, isolated `SourceManager`/`TagStore` for 5 seconds, shows connection state and received/error counts, and tears everything down on close — it never touches the runtime or the document's real tag store.
+
+### Reconnection
+
+Sources reconnect automatically with exponential backoff (starting at 1 s, capped at 30 s, with jitter), with an optional maximum attempt count. Connection state is one of `disconnected`, `connecting`, `connected`, `error`.
+
+---
+
+## 6. Tags
+
+Manage the tag catalogue in *Extras → HMI / SCADA → Screen Settings…*, **Tags** tab (*Tags…* opens it directly). The document-wide runtime settings (simulation mode, script policy, fit mode, navigation, max update rate, quality indication style, pan/zoom, a design resolution, the theme and the blink half-periods) are on the **Runtime** tab. One **OK** saves all tabs as a single undoable edit; **Cancel** discards them.
+
+### Catalogue fields
+
+| Field | Meaning |
+|---|---|
+| `name` | Tag name (any string; slash-separated names like `Tank1/Level` or dot-separated like `Tank1.Level` are both common) |
+| `type` | `number` \| `integer` \| `boolean` \| `string` \| `object` |
+| `unit`, `description` | Display metadata |
+| `min` / `max` | Engineering range |
+| `decimals` | Default number formatting for this tag |
+| `access` | `r` (read-only) or `rw` (writable) |
+| `initial` | Value shown before any update arrives |
+| `staleMs` | If set, the tag's quality becomes `stale` when no update arrives within this many ms |
+| `local` | Screen variable: no data source, writes stay local |
+| `expr` | Derived-tag expression, re-evaluated whenever a referenced tag changes (e.g. `(T1 + T2) / 2`) |
+| `sim` | Simulation settings (see below) |
+| `write` | Write target (see below) |
+| `alarms` | Alarm limits (see §12) |
+| `roles` | Roles required to write to this tag |
+
+Tags used in bindings but not declared in the catalogue still work — their type is inferred from the values received, and they show up in the Tag Browser once seen.
+
+### Simulation kinds
+
+| Kind | Fields | Behaviour |
+|---|---|---|
+| `random` | `min`, `max`, integer/float | Random value each update |
+| `sine` | `min`, `max`, `period` (ms) | Sine wave |
+| `ramp` | `min`, `max`, `step`, `interval` | Steps up, wraps at `max` back to `min` |
+| `list` | `values` | Cycles through a fixed list |
+| `toggle` | `interval` (or `period`) | Flips a boolean on an interval |
+| `constant` | `values[0]` | Fixed value |
+| `script` | `code` | Custom generator, subject to script policy |
+
+Simulation is document-wide, in *Screen Settings…* → **Runtime** → **Simulation mode**: `off`, `on` (simulated tags run alongside real sources), or `only` (no real connections — used automatically by Live Preview when nothing else is reachable, and set via `hmi-sim=only` in a runtime URL).
+
+### Write targets, screen variables, derived tags
+
+A writable tag's `write` block routes writes to a source: `{source, topic, payload}` for MQTT (payload template default `'{"value":${value}}'`, with `qos`/`retain`), `{message}` for WebSocket, or `{method, url, headers, body}` for HTTP. A **screen variable** (`local: true`) has no source — writes just update the in-memory value, useful for local screen state (selected view, a UI toggle) or values later wired to a real source. A **derived tag** (`expr` set) has no source of its own either; it recomputes from other tags' current values whenever one of them changes.
+
+### Stale, quality, and system tags
+
+`good` / `bad` / `uncertain` / `stale` quality is tracked per tag. `bad` happens when an incoming value fails type coercion (the last good value is kept). `stale` happens when `staleMs` elapses with no update. Bound cells show quality via the configurable **Quality** setting (`outline` — a dashed grey border plus a small badge — or `none`).
+
+Built-in **system tags** (read-only, bindable like any tag):
+
+| Tag | Value |
+|---|---|
+| `$alarms` | JSON array of active alarms |
+| `$alarmCount` | Number of active alarms |
+| `$alarmUnack` | Number of unacknowledged alarms |
+| `$status/<sourceId>` | Connection state of that data source |
+
+### CSV / JSON import-export
+
+*Screen Settings…* → **Tags** → **Import CSV / Export CSV / Import JSON / Export JSON**. CSV columns (in order): `name,type,unit,min,max,decimals,access,initial,staleMs,simKind,simMin,simMax,simPeriod`. JSON import/export is the raw `TagDef[]` array (all fields, including `write`/`alarms`/`expr`).
+
+### Tag Browser
+
+*Extras → HMI / SCADA → Tag Browser…* opens a floating panel listing every catalogue tag plus every tag seen at runtime, with a search box. While a runtime (or Live Preview) is running it shows live value and quality (refreshed at 4 Hz), and offers:
+
+- **Drag-to-bind** — drag a row onto a shape to create a default binding: `style:flowAnimation` for an edge, `prop:value` for an `mxgraph.hmi.*` widget, `style:hmiLevel` for a shape that already has a level (or a cylinder), otherwise `label`.
+- **Manual override** — the pencil (✎) button next to a value prompts for a new value and writes it directly into the running tag store (and into the simulator, if that tag is simulated), for testing triggers without waiting for real data.
+
+---
+
+## 7. Bindings
+
+A binding maps a tag (or expression) to one property of a cell. Add/edit them from the Format panel's **HMI** tab (select a cell → **Bindings** section → Add), or via drag-and-drop from the Tag Browser.
+
+### Targets
+
+| Target | Applies to |
+|---|---|
+| `label` | The cell's text |
+| `tooltip` | The cell's tooltip |
+| `visible` | Show/hide the cell |
+| `attr:<name>` | A user-object attribute (updates `%name%` placeholders in labels) |
+| `style:<key>` | Any style key (`fillColor`, `strokeColor`, `fontColor`, `opacity`, `rotation`, `hmiLevel`, `flowAnimation`, …) |
+| `geo:x` \| `geo:y` \| `geo:width` \| `geo:height` | A geometry offset relative to the design value |
+| `prop:<name>` | A widget-specific runtime property — shorthand for `style:hmi<Name>` (first letter upper-cased), e.g. `prop:value` → `style:hmiValue` |
+| `prop:series` | Appends `(ts, value)` to the cell's overlay series buffer (used by the trend chart); takes `maxPoints` and `name` alongside the binding |
+
+### Transforms
+
+| Kind | Fields | Behaviour |
+|---|---|---|
+| `scale` | `inMin, inMax, outMin, outMax, clamp` | Linear scaling, optional clamping |
+| `map` | `entries: [{operator, value, output}], default` | First matching entry wins (same operators as trigger conditions, §9) |
+| `invert` | — | Boolean invert |
+| `expr` | `expr` | The HMI expression language: arithmetic, comparison, logical/ternary operators, string concatenation, functions `min max abs round(x[,n]) floor ceil clamp fmt str num bool len now() if(c,a,b)`; references `value` and other tags via `tag("name")` |
+| `script` | `code` | Async, sandboxed script (§16); returns the transformed value |
+
+### Formatting
+
+`format: {decimals, pattern, unit}` on a `label`/`tooltip`/`attr:` binding controls number formatting (decimals, unit suffix pulled from the tag's catalogue `unit`). `--` is shown for `null`/`undefined`.
+
+### Placeholders
+
+Inside a label or tooltip of a cell with `placeholders="1"`, `%tag:<name>%` (optionally `%tag:<name>|<format>%`, e.g. `%tag:Tank1.Level|0.0%`) resolves to the current formatted tag value. In edit mode with Live Preview off, it shows the tag's simulated/initial value from the catalogue, or `--`.
+
+### Multi-selection and group targets
+
+- A binding template using `Tag{id}` — `{id}` (and any other `{attrName}`) is substituted per cell from that cell's own id/attributes when applied to a multi-selection (**Animation Links…** with several objects selected), so the same dialog wires up several similar shapes at once.
+- **Group-level bindings**: a binding may carry `targetCells: {cells: [ids], tags: [cellTags], path: 'i/j'}` to apply its value to descendant cells of a group/container — by id, by draw.io cell tag among descendants, or by a relative child-index path.
+- **Parameterised tags**: a tag name may itself contain `%attr%` placeholders resolved from the cell's (or an ancestor's) attributes, so one reusable symbol (e.g. a "Pump" group) can be instantiated per device just by setting an attribute.
+
+### Bad-quality display
+
+When a bound tag's quality is `bad` or `stale`, the cell shows the document's configured quality indication (default: dashed grey outline + badge).
+
+### JSON example
+
+```json
+{"tag": "Tank1.Level", "target": "style:hmiLevel", "format": {"decimals": 1}}
+```
+
+```json
+{"expr": "tag(\"T1\")+tag(\"T2\")", "target": "label", "format": {"decimals": 0, "unit": true}}
+```
+
+---
+
+## 8. Events & actions
+
+Add event handlers in the **Animation Links** dialog (**Touch → Actions → Event Handlers**; select the object and click **Animation Links…** in the HMI tab). Each handler:
+
+```json
+{"on": "click", "conditions": [], "conditionType": "and", "actions": [...], "confirm": true, "delay": 0, "stopOnError": false}
+```
+
+### Events
+
+| `on` | Fires when |
+|---|---|
+| `click`, `dblclick`, `mousedown`, `mouseup` | Mouse interaction |
+| `enter`, `leave` | Hover in/out |
+| `valueChange` | Any bound tag on the cell changes |
+| `pageOpen`, `pageClose` | The page (or the runtime) opens/closes |
+| `message` | A named message fired by an `emit` action elsewhere (`message` field selects which name, or all if omitted) |
+| `contextmenu`, `longpress` | Right-click / long-press (touch) |
+| `change` | A control widget's value is committed (numeric input, dropdown) |
+
+Handlers run only in runtime mode, or in edit mode with Live Preview **and** Interactive both on. Events on hidden/disabled cells are ignored; an event not handled on a cell bubbles to its parent group.
+
+### Actions
+
+| Type | Fields | Notes |
+|---|---|---|
+| `setProps` | `target, style:{}, attrs:{}, label, visible` | Values may contain `${var}`; transient (overlay only) |
+| `writeTag` | `tag`, and one of `value` \| `expr` \| `prompt:{title}` \| `fromWidget:true` | Routed through the tag's write target; `fromWidget` uses the value the operator just typed/selected |
+| `toggleTag` | `tag` | Inverts a boolean tag |
+| `pulseTag` | `tag, value, reset, ms` | Writes `value`, then writes `reset` after `ms` |
+| `navigate` | `page` (id or name) \| `url` | Page switch or external navigation |
+| `openUrl` | `url, target` | Opens a URL (`Graph.sanitizeLink` applied) |
+| `dialog` | `page` \| `url`, `title, width, height` | Faceplate: renders another page read-only in a floating window, or a sandboxed iframe for a URL |
+| `startAnimation` / `pauseAnimation` / `stopAnimation` | `target, name` | Controls a named animation on target cells |
+| `emit` | `name, payload` | Fires a named message, received by `message` event handlers |
+| `send` | `source, topic, payload, method, url` | Publishes an arbitrary payload directly to a source |
+| `notify` | `text, level` | Toast message (`info`/`warn`/`error`) |
+| `postMessage` | `to: 'parent' \| <cellId>`, `data` | To the embedding host, or into an iframe-widget cell |
+| `script` | `code` | Sandboxed script (§16) |
+| `drawioAction` | `action` | Runs an existing draw.io custom-link action (`show`, `hide`, `toggle`, `highlight`, `fadeIn`, `flow`, …) via `Graph.executeCustomActions`, forced transient |
+| `ackAlarms` | `tag` (optional) | Acknowledges one alarm, or all when omitted |
+| `playMedia` | `target, command: play\|pause\|stop` | Controls `<video>`/`<audio>` inside the target cell |
+
+Actions in a handler run **sequentially**; each may set its own `delay` (ms). A failing action is logged to diagnostics and does not stop the rest unless the handler sets `stopOnError`.
+
+### Confirmation, delay, conditions
+
+- `confirm: true` (or `{title, text}`) shows a confirm dialog before the actions run — this is the mechanism behind `hmiConfirm`-style write protection (see also the built-in control widgets' own `hmiConfirm` style key, default on, described in §11).
+- `delay` on the handler delays running its actions; `delay` on an individual action delays just that step.
+- `conditions`/`conditionType` gate the whole handler using the same condition syntax as triggers (§9).
+
+### Custom links referencing HMI actions
+
+Existing draw.io `data:action/json` custom links keep working in runtime mode and may include `{"hmi": {...}}` entries, handled by the same action executor (`Graph.customActionHandler`) that HMI events use.
+
+---
+
+## 9. Triggers & state machines
+
+Triggers evaluate whenever a tag they reference changes, and run actions on state transitions — never on every update. They come in two scopes, with the same forms:
+
+- **Object triggers and object state machines** are in the **Animation Links** dialog (**Scripts → Triggers → Object Triggers / Object State Machines**). They belong to the object: they are copied, pasted and deleted with it, and actions without a target act on the object itself. Use them for logic that travels with a symbol, such as a reusable pump.
+- **Page triggers and page state machines** are on the **Page Triggers** tab of **Screen Settings…**. They belong to the page and do not depend on any object. Use them for page-wide logic, such as opening a window on an alarm. **Add Page Trigger** creates a trigger: conditions with and/or, actions, else actions, deadband and on/off delays. **Add Page State Machine** creates a state machine: named states, each with its own conditions and actions.
+
+In conditions, a boolean tag matches `true`/`false`, `1`/`0`, `on`/`off` or `yes`/`no`.
+
+### Trigger
+
+```json
+{
+  "name": "HighLevel",
+  "conditions": [{"tag": "Tank1.Level", "operator": ">", "value": 90}],
+  "conditionType": "and",
+  "actions": [
+    {"type": "setProps", "target": "self", "style": {"strokeColor": "#e74c3c"}},
+    {"type": "startAnimation", "target": "self", "name": "blink"}
+  ],
+  "elseActions": [
+    {"type": "setProps", "target": "self", "style": {"strokeColor": "#607d8b"}},
+    {"type": "stopAnimation", "target": "self", "name": "blink"}
+  ]
+}
+```
+
+`actions` run on the false→true transition; `elseActions` run on the true→false transition. An empty `conditions` array is always true.
+
+### State machine
+
+```json
+{
+  "name": "PumpState",
+  "states": [
+    {"name": "fault", "conditions": [{"tag": "Pump1.Fault", "operator": "==", "value": true}], "actions": [...]},
+    {"name": "running", "conditions": [{"tag": "Pump1.Run", "operator": "==", "value": true}], "actions": [...]},
+    {"name": "stopped", "conditions": [], "actions": [...]}
+  ]
+}
+```
+
+States are evaluated in order; the first matching state is entered, and its actions run only on entry (not on every subsequent update). List the "always true" fallback state last, with empty `conditions`.
+
+### Condition operators
+
+`==`, `!=`, `>`, `<`, `>=`, `<=`, `range` (`[a,b)`, value as `[a,b]` or `"a,b"`) and `!range`, `in`/`!in` (set membership, items may include `a..b` ranges), `changed`, `isBad` (quality not `good`), `true` (always true — used for an "else" state).
+
+### Hysteresis and delay
+
+A trigger may declare `deadband` (numeric hysteresis) and `onDelay`/`offDelay` (ms).
+
+### Document-level triggers and initial evaluation
+
+Triggers stored under the document config's `triggers` (not attached to a cell) run page-wide logic independent of any one shape. On runtime start, all triggers are evaluated once against the initial values — after the first data arrives, or after a configurable timeout (`DRAWIO_CONFIG.hmi.initialTimeout`, default 1000 ms) — so the screen opens in the correct state even before live data settles.
+
+---
+
+## 10. Animations & flow
+
+### Named animations and presets
+
+```json
+{"name": "spin", "preset": "spin", "params": {"rpmTag": "IntakePump.Speed"}, "autoPlay": true}
+```
+
+| Field | Meaning |
+|---|---|
+| `preset` | `blink` \| `pulse` \| `spin` \| `shake` \| `colorCycle` \| `fadeInOut`, or `null` for a pure keyframe animation |
+| `params.rate` | Blink/pulse rate override (frequency) |
+| `params.rpm` / `params.rpmTag` | Spin speed in RPM, static or bound to a tag (recomputed live as the tag changes) |
+| `params.colors` | `colorCycle` palette (default red/yellow/green) |
+| `autoPlay` | Starts automatically when the page opens |
+| `cycles` | `0` = infinite |
+| `duration`, `easing` | For keyframe animations (`linear`/`ease-in`/`ease-out`/`ease-in-out`) |
+| `keepState` | Keep the final frame's appearance after the animation completes, instead of reverting |
+| `next: {target, name}` | Chains into another animation on completion; also fires an `animationEnd` event on the cell |
+| `frames: [{duration, props}]` | Keyframe list; `props` may include `rotation, opacity, fillColor, strokeColor, fontColor, dx, dy, scale, visible, hmiLevel` |
+
+Presets `blink`/`pulse`/`spin`/`shake`/`fadeInOut` run as CSS animations (no per-frame JS cost); `colorCycle` and keyframe animations are interpolated per render frame. Animations pause automatically when the browser tab is hidden, and respect `prefers-reduced-motion` (blink falls back to a static high-contrast outline). Start/stop/pause an animation from a trigger or event via the `startAnimation`/`pauseAnimation`/`stopAnimation` actions.
+
+### Edge flow animation
+
+Standard draw.io `flowAnimation=1` is extended with:
+
+| Style key | Values |
+|---|---|
+| `flowAnimationType` | `dash` (built-in) \| `dots` \| `beads` \| `arrows` \| `liquid` |
+| `flowAnimationReverse` | `0`/`1` |
+| `flowAnimationDuration` | ms |
+| `flowAnimationColor` | colour |
+| `flowAnimationWidth` | width |
+
+Bind `style:flowAnimation` to a run/stop tag, and `style:flowAnimationType`/`style:flowAnimationColor` to change the flow's look live (e.g. a pipe shown as `liquid` while a pump is running).
+
+### Level fill
+
+Any vertex shape supports a level fill via style keys `hmiLevel` (value, default range 0–100), `hmiLevelMin`/`hmiLevelMax`, `hmiLevelColor`, `hmiLevelDirection` (`up`/`down`/`left`/`right`), `hmiLevelOpacity`. The fill is built as a closed path reusing the shape's own outline (no canvas clipping), so it works on the `mxgraph.hmi.tank` widget, plain cylinders, P&ID vessel stencils, or any other vertex.
+
+---
+
+## 11. Widget library
+
+All HMI widgets are `shape=mxgraph.hmi.*` cells, in the **HMI / SCADA** sidebar category (*More Shapes*), grouped into palettes: **Displays**, **Controls**, **Charts**, **Media**, **Equipment**, **Pipes**. Every widget that shows a live value reads it from the style key **`hmiValue`** — a binding with `target: 'prop:value'` writes to that same key, so the design-time default and the live value use one code path. Non-good quality shows as a dashed border plus a small badge (never colour alone).
+
+| Widget | Key style keys | Typical binding |
+|---|---|---|
+| `numDisplay` — numeric display | `hmiValue, hmiDecimals, hmiUnit, hmiPrefix, hmiAlign, hmiLcd, hmiQuality` | `prop:value` |
+| `radialGauge` — radial gauge | `hmiValue, hmiMin/hmiMax, hmiStartAngle/hmiEndAngle, hmiMajorTicks/hmiMinorTicks, hmiBands ("min:max:color,...")`, `hmiNeedleColor, hmiUnit, hmiDecimals` | `prop:value` |
+| `linearGauge` — linear gauge/bar | `hmiValue, hmiMin/hmiMax, hmiOrientation, hmiBands, hmiTicks, hmiFillColor, hmiUnit, hmiDecimals` | `prop:value` |
+| `tank` — tank/vessel | `hmiValue, hmiMin/hmiMax, tankType (vertical\|horizontal\|coneBottom\|sphere), hmiLiquidColor, hmiShowScale, hmiUnit` | `prop:value` |
+| `lamp` — indicator lamp/LED | `hmiValue, hmiOnColor/hmiOffColor/hmiFaultColor, hmiStates, hmiShape (round\|square)` | `prop:value` |
+| `switch` — toggle switch | `hmiValue (bool), hmiOnColor/hmiOffColor, hmiDisabled, hmiOnLabel/hmiOffLabel` | `prop:value`; click runs `toggleTag` at runtime |
+| `button` — push button | `hmiMode (momentary\|latched), hmiValue, hmiOnColor/hmiOffColor, hmiDisabled` | write-on-press (momentary) or `toggleTag` (latched) |
+| `slider` — set-point slider | `hmiValue, hmiMin/hmiMax, hmiStep, hmiOrientation, hmiTrackColor/hmiThumbColor` | `prop:value`; writes on release, arrow keys adjust when focused |
+| `numInput` — numeric/text input | `hmiValue, hmiUnit, hmiEditable, hmiDecimals` | `prop:value`; runtime overlays a real `<input>` for typing |
+| `dropdown` — multi-state selector | `hmiValue, hmiOptions ("value:label,...")` | `prop:value`; writes selected value |
+| `trendChart` — trend line chart | `hmiTimeWindow, hmiYMin/hmiYMax, hmiLineColor, hmiGridColor, hmiShowLegend, hmiFillArea` | `prop:series` (appends points) |
+| `barChart` / `pieChart` | `hmiValue (JSON), hmiBarColor/hmiOrientation` (bar); `hmiShowLegend/hmiDonut` (pie) | `prop:value` |
+| `table` — data table | `hmiValue (JSON rows), hmiColumns, hmiHeader, hmiStripe, hmiMaxRows, hmiAutoScroll, hmiScrollInterval` | `prop:value` |
+| `alarmBanner` / alarm list | `hmiValue` (JSON alarm array) | typically `$alarms` (system tag) |
+| Equipment: `pump`, `fan`, `motor`, `agitator`, `valve`, `conveyor`, `heatExchanger`, `pipeTee`, `pipeElbow` | `hmiValue`/`hmiState` (0 stopped/grey, 1 running/green, 2 fault/red, 3 transit/amber; valve: 0 closed/1 open), `hmiStates` override map | `prop:value`; `spin` animation for rotating equipment (pump/fan/motor/agitator) |
+| Pipe (edge) | `shape=pipe`, `flowAnimation*` (see §10) | `style:flowAnimation`, `style:flowAnimationType` |
+| `clock` — date/time display | `hmiValue (timestamp or blank='now'), hmiFormat, hmiAnalog` | usually unbound (reads system clock) |
+| `statusIndicator` — connection status | `hmiValue (connected\|connecting\|error\|disconnected)` | `$status/<sourceId>` |
+| `iframe`, `video`, `echarts` (runtime-only) | `hmiUrl, hmiRefresh, hmiSandbox` (iframe); `hmiUrl, hmiAutoplay, hmiMuted, hmiLoop` (video); `hmiOption` (echarts) | Live only inside the runtime; a plain placeholder is shown at design time and in exports |
+
+Every value-showing widget accepts its value both from a binding and as a static design-time default (useful for mock-ups before any tag exists). Interactive widgets (switch, button, slider, numInput, dropdown) are keyboard-operable at runtime (Tab to focus, Enter/Space to activate, arrow keys adjust a slider) and expose ARIA roles/labels. The full style-key reference, including chart and equipment shapes, is in [`docs/SHAPES.md`](SHAPES.md).
+
+### Ready-made templates
+
+Four complete example screens ship under *File → New* in the **HMI / SCADA** template category (they are also found by searching `hmi` or `scada`):
+
+| Template | File |
+|---|---|
+| Water Treatment Plant | `templates/water_treatment.xml` |
+| Tank Farm | `templates/tank_farm.xml` |
+| Motor Control Center | `templates/motor_control_center.xml` |
+| Building HVAC | `templates/building_hvac.xml` |
+
+They are installed as `plugins/draw.hmi/templates/`.
+
+Each template ships with its own simulated tags (`sim: "only"`) so it runs immediately without any real data source.
+
+---
+
+## 12. Alarms
+
+A tag's `alarms` block declares limits: `hihi`, `hi`, `lo`, `lolo` (numeric), or `bool` (a boolean alarm value), plus `deadband`, per-limit `severity` (1 = highest … 4 = lowest) and per-limit `messages`.
+
+Two more InTouch alarm kinds are available. A **deviation** alarm (`target` as a number or tag name, `minorDev`, `majorDev`) has the levels `minor` and `major`. A **rate-of-change** alarm (`roc`, in units per second) is active while the value changes faster than the limit.
+
+- **Alarm list.** Active alarms are tracked session-locally with state `active-unack`, `active-ack`, or `cleared-unack`. Its own floating window (separate from the Diagnostics panel) opens by clicking the alarm summary in the runtime status bar. Acknowledge individually or all at once (**Acknowledge all**).
+- **`hmiAlarmIndicator=1`** on any cell bound to an alarmed tag applies the alarm's severity colour to its stroke and blinks while unacknowledged (stops blinking once acknowledged); the highest-severity active alarm among the cell's bound tags wins.
+- **Alarm Banner / Alarm List widgets** (`mxgraph.hmi.alarmBanner`, §11) render the `$alarms` system tag (or any JSON array in the same shape) directly on the screen.
+- **Audible alarms** (optional, `runtime.alarmSound` or `DRAWIO_CONFIG.hmi.alarmSound`, `true` or a max-severity number) play a short tone via the Web Audio API for new unacknowledged alarms at or above that severity — browsers only allow this after a user gesture on the page.
+- **External acknowledgement** — `runtime.ackTarget = {source, topic|url, payload, method, qos}` (with `${tag}`/`${ts}`/`${user}` placeholders) publishes every acknowledgement to a data source, e.g. for external persistence.
+
+---
+
+## 13. Running screens
+
+### Run Screen and runtime chrome
+
+*Extras → HMI / SCADA → Run Screen* opens the current file in a new tab or window, after the safety notice (§1). By default this is the **lightweight runtime page** `plugins/draw.hmi/hmi-run.html#R<data>`.
+
+The page loads only:
+- draw.io's own `js/viewer.min.js`: the viewer core (mxGraph plus draw.io's graph and shape renderer).
+- `plugins/draw.hmi/hmi-runtime.js`: the HMI shapes and the HMI runtime.
+- `js/PreConfig.js`, so `DRAWIO_CONFIG.hmi` applies.
+
+It does not load the editor application (`app.min.js`, 9.5 MB). It also never fetches anything from diagrams.net, so it works on isolated plant networks.
+
+Other ways to open screens on `hmi-run.html`:
+- `hmi-run.html#U<url-encoded URL>` loads a published `.drawio` file directly.
+- `hmi-run.html?url=<url-encoded URL>` does the same.
+
+The previous full-app runtime (`index.html?hmi=run`, draw.io's lightbox view) is still supported. Use it with `DRAWIO_CONFIG.hmi.runPage = 'app'`, or by opening that URL directly.
+
+Both runtimes are locked views: no editing, no selection handles, no sidebar or Format panel. Multi-page files get page navigation at the top. A **status bar** at the bottom shows:
+
+- one dot per connected source (green = connected, amber = connecting, grey = disconnected, a small square = error), with the source's name and state as a tooltip of the last error;
+- the current alarm summary (click to open the Alarm List);
+- fullscreen and diagnostics buttons, and a clock.
+
+**Ctrl/Cmd+Shift+D** opens the Diagnostics panel from anywhere in the runtime.
+
+### Hover halo
+
+In a running screen, an interactive object is highlighted when the mouse is over it. Interactive objects are those with a touch link, a click/press/hover event, or a control widget such as a button or switch. The highlight gets stronger while the mouse button is held down. The object focused with Tab is highlighted the same way. Disabled and hidden objects, and objects that only display data, are not highlighted.
+
+**Page settings.** Open *Extras → HMI / SCADA → Screen Settings…* and choose the **Hover Halo** tab (*Hover Halo…* opens it directly). The tab has a live preview on a light and a dark background; point at or click the samples to see the hover and pressed looks.
+- **Presets:** Soft glow (the default), Subtle glow, Strong glow, Crisp outline, Shape outline, Dashed outline, Glow and outline, and Off. A preset keeps your colour.
+- **Style:** Glow follows the object's shape. Outline draws a crisp line around the object. Glow and outline draws both.
+- **Outline shape:** Rectangle draws the outline around the object's bounds. Follow the object's shape draws it at a fixed distance from the object's outline, so a round lamp gets a round ring and a rounded button a rounded one.
+- **Color**, **Glow size** (1–40 px), **Glow intensity** (10–100 %) and **Outline width** (1–8 px).
+- **Outline and pressed settings:** outline padding (the gap between the object and the outline), corner radius and dashed outline (rectangle only), the stronger halo while pressed (on or off), and a separate pressed colour.
+- **Reset** restores the defaults. The settings are stored in the page's `runtime.hoverHalo` and the change can be undone.
+
+**Per object.** Select objects, open **Animation Links…** and use the **Hover Halo** link (Touch tab). Choose the style (Page default, Glow, Outline, Glow and outline, or Off), the outline shape (Page default, Rectangle, or Follow the object's shape) and optionally a colour (empty means the page colour). These are stored as the styles `hmiHaloStyle`, `hmiHaloOutline`, `hmiHaloColor` and `hmiHalo=0`.
+
+**For administrators.** `DRAWIO_CONFIG.hmi.hoverHalo` sets the default for every screen; a page's own settings win. It is `false` (off) or an object with any of `preset`, `style` (`glow`, `outline`, `glowOutline`), `outlineShape` (`rect`, `shape`), `color`, `size`, `intensity`, `width`, `padding`, `radius`, `dashed`, `press`, `pressColor` and `pressSize`, for example `{preset: 'crispOutline', color: '#FFB300'}`.
+
+### Kiosk URL parameters
+
+| Parameter | Effect |
+|---|---|
+| `hmi=run` | Starts the full-app runtime (`index.html`); `hmi-run.html` is always in runtime mode |
+| `url=<url>` | `hmi-run.html` only: loads the diagram from a URL |
+| `page-id=<id>` | Opens on a specific page |
+| `hmi-fit=none\|page\|width\|stretch` | Overrides the document's fit mode |
+| `hmi-hide-nav=1` | Hides the chromeless toolbar/page navigation |
+| `hmi-hide-status=1` | Hides the status bar entirely |
+| `hmi-role=<role[,role...]>` | Sets the runtime user's roles (subject to `DRAWIO_CONFIG.hmi.allowUrlRoles`) |
+| `hmi-reload=<minutes>` | Reloads the page periodically (leak recovery for unattended kiosks) |
+| `hmi-sim=off\|on\|only` | Overrides the document's simulation mode |
+
+### Fit modes and ISA-101 theme
+
+`runtime.fit`: `none` (no auto-zoom), `page` (fit the whole page — default), `width` (fit width only), `stretch`. `runtime.width`/`runtime.height` optionally pin a design resolution. The layout re-fits on window resize. These settings, and the theme, are on the **Runtime** tab of *Screen Settings…*. `runtime.theme: 'isa101'` applies a neutral grey background (colour reserved for abnormal states, per the ISA-101 high-performance HMI style); `default` leaves draw.io's normal background.
+
+### Pages & navigation
+
+`runtime.nav`: `tabs` (default chromeless page tabs) or `none`. Page switches can also be driven purely by `navigate` actions (§8). On a page switch, the outgoing page's bindings/triggers/animations are torn down and the new page's are built; file-scoped sources stay connected across pages, page-scoped sources reconnect.
+
+### Faceplates and dialogs
+
+The `dialog` action (§8) opens either another page, read-only, as a floating faceplate window bound to the same live tag store (bindings and click actions work; animations are not driven inside a faceplate — no its own render loop), or a sandboxed iframe for an external URL. Multiple faceplates can be open at once.
+
+### Keyboard operation
+
+Interactive widgets are reachable by Tab and operate with Enter/Space (and arrow keys for sliders), per §11.
+
+---
+
+## 14. Embedding
+
+### postMessage API
+
+Available when the runtime is loaded in the standard draw.io embed mode (`?embed=1&proto=json`), in addition to the existing embed protocol:
+
+| Direction | Message | Purpose |
+|---|---|---|
+| Host → draw.io | `{action: "hmiSetValues", values: {tag: value, ...} \| [{tag, value, ts, quality}]}` | Push tag values in |
+| Host → draw.io | `{action: "hmiRun"}` / `{action: "hmiStop"}` | Start/stop the runtime |
+| Host → draw.io | `{action: "hmiNavigate", page}` | Switch page |
+| Host → draw.io | `{action: "hmiGetTags"}` | Request a tag snapshot |
+| Host → draw.io | `{action: "hmiSetRoles", roles: [...]}` | Set the runtime user's roles |
+| Host → draw.io | `{action: "hmiSetHostTags", tags: [{name, type, unit, description}]}` | Tags the host provides: offered by the tag pickers and the Tag Browser, not saved in the diagram |
+| Host → draw.io | `{action: "hmiWrite", tag, value}` | Issue a validated write |
+| draw.io → host | `{event: "hmiReady"}` | The HMI plugin is loaded. It loads after the embed protocol's `init` and `load`, so send `hmi*` messages after this event |
+| draw.io → host | `{event: "hmiWrite", tag, value, cellId}` | A write targeted a `host` source, or `forwardWrites` is on |
+| draw.io → host | `{event: "hmiEvent", name, payload, cellId}` | An `emit` action fired |
+| draw.io → host | `{event: "hmiStatus", sources}` | Source connection status changed |
+| draw.io → host | `{event: "hmiTags", tags}` | Response to `hmiGetTags` |
+| draw.io → host | `{event: "hmiStarted"}` / `{event: "hmiStopped"}` | Runtime lifecycle |
+| draw.io → host | `{event: "hmiPostMessage", data, cellId}` | A `postMessage` action targeting `parent` |
+
+Only messages from `window.parent`/`window.opener` are accepted (the existing embed security rule); credentials are never included in outgoing messages.
+
+### JS API (`ui.hmi`)
+
+When draw.io is embedded as a JS application (not just an iframe with postMessage), `ui.hmi` exposes: `run(options)`, `stop()`, `isRunning()`, `setValues(values)`, `getValue(tag)`, `getTags()`, `write(tag, value) → Promise`, `subscribe(fn) → unsubscribe`, `onStart(fn)`, `getRuntime()`, `setHostTags(tags)`.
+
+### Standalone viewer
+
+draw.io's viewer (`js/viewer.min.js` or `js/viewer-static.min.js`) followed by `plugins/draw.hmi/hmi-runtime.js` embeds an HMI screen into a third-party page without the full editor, using the existing draw.io viewer embed convention:
+
+```html
+<div class="mxgraph" data-mxgraph='{"xml": "...", "hmi": {"sim": "only"}}'></div>
+<script src="https://your-host/js/viewer-static.min.js"></script>
+<script src="https://your-host/plugins/draw.hmi/hmi-runtime.js"></script>
+```
+
+`"hmi"` may be `true` or `{sim, interactive, roles, keyScope, config}`, where `config` is merged into `DRAWIO_CONFIG.hmi` for that embed. The runtime API is available on the viewer instance as `viewer.hmi`.
+
+Hosts with several viewers in one page (for example dashboard panels):
+- `keyScope: 'container'` makes key equivalents act only while the focus is inside that viewer. The viewer's container becomes focusable, so a click on it gives it the keys. The default, `'document'`, listens on the whole page.
+- `Hmi.Viewer.detach(viewer)` stops the runtime, removes it from `Hmi.Viewer.instances` and destroys the graph, for viewers that are unmounted.
+
+---
+
+## 15. Importing meta2d screens & exporting HTML
+
+**Import.** *Extras → HMI / SCADA → Import meta2d JSON…* converts a meta2d.js (`@meta2d/core`) JSON export into draw.io cells with HMI attributes: pens → shapes, `networks` → sources, `realTimes` → bindings + tag catalogue, `events`/`triggers` → HMI events/triggers, `frames` → animations. Unsupported meta2d features (JetLinks/ADIIOT/SQL networks, `table2`, most chart types, `SendData`, etc.) are reported in a dialog listing exactly what was skipped, rather than silently dropped. If the app supports multiple pages, the import lands on a new page named after the source file.
+
+**Export.** *Extras → HMI / SCADA → Export HMI Screen (HTML)…* saves a self-contained `.html` file for the current screen. By default it's a thin wrapper embedding an iframe that points at this deployment's `hmi-run.html` runtime URL; if a standalone viewer bundle is configured (`Hmi.viewerBundleUrl`), it instead inlines the viewer script directly with the diagram data, so the exported file needs no round trip back to this server.
+
+---
+
+## 16. Diagnostics & validation
+
+**Diagnostics** (*Extras → HMI / SCADA → Diagnostics…*, or Ctrl/Cmd+Shift+D in the runtime) is a tabbed window:
+
+| Tab | Shows |
+|---|---|
+| Sources | Per-source state, received/error counts, last message time/error; click a row to see its last messages (a 100-entry ring buffer, secrets redacted) |
+| Rate | Frame count, tag updates processed, cells flushed per second |
+| Log | The diagnostics log (level/category filterable): warnings, errors, script/binding failures |
+| Writes | The write audit log (timestamp, tag, value, outcome) |
+
+**Validate** (*Extras → HMI / SCADA → Validate…*) is a static check over the current page's configuration, listing errors and warnings, click-to-select the offending cell:
+
+- bindings/conditions referencing undeclared tags (warning);
+- invalid expressions (error, with the parser's message);
+- write actions targeting a read-only tag (error);
+- `navigate`/`dialog` actions targeting a missing page (error);
+- action targets referencing a missing cell id (error);
+- MQTT sources with no subscribed topics, HTTP sources with no URL (error/warning);
+- scripts present while the effective script policy is `off` (warning);
+- schema violations in any source/tag/binding/event/trigger/animation entry (error).
+
+---
+
+## 17. Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---|---|
+| A source never connects, browser console shows a CSP error | The endpoint isn't in the page's CSP `connect-src` (and, on a hardened deployment, not in `DRAWIO_CONFIG.hmi.allowedEndpoints`). See [HARDENING.md](HARDENING.md). Remember app.diagrams.net never allows this (§2). |
+| "Endpoint not allowed" style error at connect time | `DRAWIO_CONFIG.hmi.allowedEndpoints` is set and the source's URL doesn't match any prefix/regex entry — add it, or fix the source URL. |
+| Scripts (parser/transform/action) silently don't run | The effective script policy is `off` — check `DRAWIO_CONFIG.hmi.scripts` and the document's own `scripts` setting in *Screen Settings…* → **Runtime** (a document can only restrict, never relax, the deployment policy). Validate (§16) flags this. |
+| A value shows `--` or a dashed border with a `?` badge | Quality is `bad` (failed type coercion — check the tag's declared `type`) or `stale` (no update within `staleMs`). Check the source in Diagnostics → Sources. |
+| Runtime feels sluggish under heavy load | The runtime already adapts: **Adaptive rate** lowers the effective update rate (down to 2 Hz) when frames run late or use over ~60% of the frame budget, and recovers gradually — check the current rate in Diagnostics → Rate. You can also lower `runtime.maxRate` (document-wide) or `DRAWIO_CONFIG.hmi.maxRate` (deployment-wide, default 30 Hz), and use `flowAnimation`/animations sparingly on very large screens. |
+| Off-screen animations still seem to cost CPU | Per the SRS, only tab-hidden pausing is guaranteed; strict per-cell viewport culling is a "should", not implemented as a hard guarantee everywhere — keep large numbers of continuously-animated cells (spin/pulse/colorCycle) to what's actually visible on a typical operator screen. |
+| A password/token appears to leak | It shouldn't: credentials are never written to the diagnostics log, exports, or postMessage events (`HMI-SEC-6`). If you see one, treat it as a bug and check whether `credentials.mode` is `save` (stored in the file) rather than `prompt`/`param`. |
+
+For deployment-wide security configuration (endpoint allow-listing, script policy, roles, CSP), see [HARDENING.md](HARDENING.md). For setting up a gateway between field protocols (Modbus/OPC UA/S7/BACnet) and an HMI-compatible source (MQTT/WS/HTTP/SSE), see [GATEWAY_GUIDE.md](GATEWAY_GUIDE.md). For running local MQTT/WS/HTTP/SSE test servers while developing screens, see [`tools/dev/README.md`](../tools/dev/README.md).
+
+---
+
+## 18. InTouch animation links
+
+The plugin implements every animation link of AVEVA InTouch (Visualization Guide, chapter 4). If you know InTouch, you can configure objects the same way:
+
+- **Display links:** value display, location, orientation, size, line / fill / text colour, percent fill, blink, visibility, disable and tooltip.
+- **Object Size** also has **Scale**, which changes width and height together around an anchor (centre, an edge, a corner or a point at an X / Y offset from the centre). Height and Width can also be anchored at such an offset, like the rotation point of Orientation.
+- **Touch links:** user inputs, sliders, pushbuttons, action scripts and show / hide window.
+
+The template **InTouch Animation Links** (*File → New → Hmi*) shows each link working. `docs/INTOUCH_MAPPING.md` lists every guide section with its implementation.
+
+### Configuring links
+
+1. Open the **Animation Links** dialog in one of three ways:
+   - Select one or more objects and choose **Animation Links…** from the context menu.
+   - Use the **Animation Links…** button in the HMI tab of the format panel.
+   - Alt+double-click an object.
+2. The dialog has four tabs: **Display**, **Animation**, **Touch** and **Scripts**. Each tab shows how many links are enabled in it, for example **Touch (3)**. The dialog opens on the tab of the first enabled link and remembers the tab you used last. Arrow keys move between the tabs. Tick a link to enable it, then click its **…** button to open its settings. The settings use the field names of the InTouch dialogs.
+   - Click the small **i** icon next to a tab, a group, a link or a field to see what it does, with valid values and examples. Press Esc or click elsewhere to close the help.
+   - The other HMI dialogs and forms have the same **i** icons: Screen Settings (every tab: Data Sources, Tags with the tag editor, simulation and alarms, Page Triggers, Runtime, Hover Halo, Window), Tag Browser, Substitute Tags, Define Missing Tags, Validate, Diagnostics, and the HMI tab of the format panel.
+3. Enter expressions in InTouch syntax:
+   - Bare tag names: `TankLevel > 75`.
+   - Operators: `AND`, `OR`, `NOT`, `MOD`, `<>`.
+   - Dotfields: `Tank.MaxEU`, `Pump.Alarm`.
+   - Functions: `Text(Level, "#.0")`, `StrUpper(Mode)`, `IF(c, a, b)` and others.
+4. Double-click a tag field to open the **Tag Browser** in select mode. It supports wildcard filters such as `Tank*` and `Pump?`.
+
+For analog value displays and inputs, the **field text** is the object's label. A numeric mask in it is replaced by the formatted value, for example `Level = #.# %` or `000.00`. Advanced formatting (fixed decimal, exponential, hex or binary bits, fixed width) is set in the link's format settings.
+
+A small chain badge marks objects with links while the HMI tab or the Animation Links dialog is open.
+
+### Tags
+
+**Extras → HMI / SCADA** has two tag commands:
+- **Substitute Tags…** renames the tags of the selected objects in one undoable step. This is how you reuse a graphic for another unit.
+- **Define Missing Tags…** adds undeclared tags to the catalogue, with the type inferred from the links that use them.
+
+### Running
+
+At runtime:
+- Display links update when their tags change.
+- Blinking is synchronised. Set the half-periods with `runtime.blink` in the document, or globally with `DRAWIO_CONFIG.hmi.blink` (`{slow: 1000, medium: 500, fast: 250}` ms).
+
+Touch links work with the mouse, touch and keyboard:
+- **User inputs** open the on-screen keypad or keyboard, or an inline editor. Set the keyboard type with `DRAWIO_CONFIG.hmi.keyboard` (`standard`, `system` or `resizable`).
+- **Sliders** move the object while you drag it.
+- **Pushbuttons** write on press and release.
+- **Action scripts** run QuickScript on their conditions (On Left Down, While Left Down, On Mouse Over and the others). They support assignments, `IF … THEN … ELSE … ENDIF`, `FOR … NEXT`, `Show`, `Hide`, `HideSelf`, `ShowAt`, `ShowTopLeftAt`, `DialogValueEntry`, `DialogStringEntry` and `LogMessage`.
+- **Key equivalents** (for example Ctrl+D or F2) activate a link from the keyboard. Tab moves between touch objects and Enter activates the focused one.
+- **Disabled and invisible objects** ignore all input.
+
+### Bindings, keyframes, events, security, hover halo and triggers
+
+The same dialog also edits the generic HMI features of the object. They are stored in their own attributes (`hmiBindings`, `hmiAnimations`, `hmiEvents`, `hmiRoles` with `hmiRolesMode`, the styles `hmiHalo*` and `hmiTriggers`), so existing diagrams keep working. A link is on while its storage is not empty; clearing the checkbox empties it.
+
+- **Display, States and Properties, Bindings**: tag or expression to any property, with transform and format.
+- **Animation, Keyframe Animations**: named animations (preset or your own frames, autoplay, cycles, then start).
+- **Touch, Actions, Event Handlers**: actions on click, double-click, enter, leave, long press, message, page open and more, with conditions, confirmation and delay.
+- **Touch, Actions, Security**: roles, and whether users without them do not see (hide) or cannot use (disable) the object. A user needs all the roles of the list. Disabled objects ignore their touch links and event handlers.
+- **Touch, Actions, Hover Halo**: halo style, outline shape and colour of this object.
+- **Scripts, Triggers**: object triggers (conditions with AND/OR, actions, else actions, deadband, on and off delay) and object state machines (ordered states with conditions and actions).
+
+List links show one line per item. Click a line to edit the item, use the arrows to reorder. All changes are written with OK as one undoable edit.
+
+The page **Object Features** of the template **InTouch Animation Links** has a tile for each of them, a page trigger and a page state machine. Run it with `&hmi-role=engineer,operator` added to the Run Screen URL to see the Security tile with roles.
+
+### Smooth changes, blended colours, alarm markers, trends and data age
+
+These options come from the Grafana plugin grafana-flowcharting. All of them are off until you set them, so existing screens look the same.
+
+- **Smooth changes.** Colours fade and position, size, rotation, opacity and percent fill glide to new values instead of jumping.
+  - For the whole page: **Screen Settings → Runtime → Smooth changes** in milliseconds, for example 500.
+  - For one object: **Animation → Smooth Changes** with its own duration. 0 switches it off for that object.
+  - The values shown when the screen opens appear at once.
+- **Blended colours.** In an analog line, fill or text colour link, tick **Blend between break points**. A value between two break points then gets a mix of their colours, for example green at 0, yellow at 50 and red at 100 give a smooth scale. Without it, the colour changes in steps.
+- **Alarm markers.** A warning triangle appears at the top right corner of an object while one of its tags is in alarm: red for high severity, orange for medium and yellow for low. It blinks until the alarm is acknowledged, and its tooltip lists the alarm messages.
+  - For every object of the page: **Screen Settings → Runtime → Alarm markers on objects**.
+  - For one object: **Display → Miscellaneous → Alarm Marker**. **Show** adds the marker even when the page option is off, optionally only for one tag. **Hide** never shows one.
+- **Tooltip trend.** In the Tooltip link, tick **Show trend**. The tooltip then shows a small chart of the recent values of the trend tag (default: the first tag of the tooltip expression) over the trend period (default 60 s), with the minimum, maximum and latest value. Values are collected from the moment the screen opens.
+- **Data age.** Colour links and Multi-State have a **Stale after (s)** field. When the tags of the link have not been updated for that long, for example because a device stopped sending:
+  - a colour link shows its **Stale colour**, such as grey;
+  - Multi-State uses the state whose match is `stale`.
+  The object returns to normal within a second of the next update.
+- **Regular expressions in Multi-State.** A state match can be a regular expression such as `/^man/i` (any text starting with "man", ignoring case) or `/warn|alarm/`.
+
+The page **Flowcharting Features** of the template **InTouch Animation Links** shows each of them. The exact storage is in `INTOUCH_LINKS.md` §13.
+
+### Extension links from meta2d
+
+The dialog also has the HMI functions of meta2d that InTouch lacks, in the same layout. `docs/META2D_INTOUCH_COMPARISON.md` compares the two products.
+
+| Band | Group | Links |
+|---|---|---|
+| Display | Miscellaneous | **Opacity**: transparency from a value |
+| Display | States and Properties | **Multi-State**: an ordered list of states, matched by value (`1`), range (`10..20`), list (`1,3,5..8`) or `*`; each sets colours, label (with `#` masks), image, opacity, visibility or blinking. **Properties**: any style key, `prop:`, attribute, label, tooltip or visibility from an expression, such as `style:flipH`. **Widget Data**: the value of a gauge, tank or table widget, and tag series for trend charts |
+| Animation | Animation | **Animation**: spin (rate in RPM), pulse, shake, fade, blink, colour cycle, bounce, sway, glow, or a named keyframe animation, while a condition holds, with rate and reverse expressions. **Flow**: pipe/edge flow while a condition holds, with type, speed, direction, colour and width. **Media**: play or pause a video/audio widget by a condition |
+| Touch | User Inputs | **Choice**: pick one option from a list |
+| Touch | Touch Pushbuttons | **Analog/String Value**: set a value, add, subtract (clamped) or write an expression |
+| Touch | Actions | **Open URL** (new tab, same window or dialog), **Send Message** (page `message` events and/or the embedding page), **Animation/Media Control** (start, pause, stop on objects), **Touch Options** (confirmation, roles, delay for all touch links of the object) |
+| Scripts | Object Scripts | **Data Change**: a QuickScript run when a value changes (with deadband). **Condition**: QuickScripts run on true, on false, while true and while false |
+
+QuickScript also gains `OpenURL`, `ShowMessage`, `SendMessage`, `PostToHost`, `StartAnimation`, `PauseAnimation`, `StopAnimation`, `PlayMedia`, `PauseMedia`, `StopMedia`, `SetProperty` and `Navigate`. In these, `"Me"` refers to the object running the script.
+
+The template's **meta2d Extensions** page shows every extension link.
+
+### Windows
+
+InTouch windows are **pages**. To make a page an overlay or popup window, use the **Window** tab of *Screen Settings…* (window type, X, Y, width, height and title), or give its document config a `window` entry:
+
+```json
+{"window": {"type": "overlay", "x": 860, "y": 120, "width": 360, "height": 260, "title": "Details"}}
+```
+
+The window types behave as follows:
+- `replace` (the default) navigates to the page. `Hide` on the current page goes back to the previous page.
+- `overlay` opens the page in a floating window.
+- `popup` opens the page in a modal floating window.
+
+`ShowAt(name, $ObjHor, $ObjVer)` places a window's centre at the object that ran the script. `ShowTopLeftAt` places its top-left corner there instead.
+
+---
+
+## Appendix: JSON reference examples
+
+### Document config (`hmi` attribute on the model root, per page)
+
+```json
+{
+  "version": 1,
+  "sim": "off",
+  "scripts": "inherit",
+  "sources": [
+    {"id": "mqtt1", "name": "Plant MQTT", "type": "mqtt", "enabled": true, "scope": "file",
+     "url": "wss://broker.plant.example.com:8884/mqtt",
+     "topics": [{"filter": "plant/#", "qos": 0}],
+     "format": {"kind": "topic", "template": "plant/{tag}"},
+     "credentials": {"mode": "none"}}
+  ],
+  "tags": [
+    {"name": "Tank1.Level", "type": "number", "unit": "%", "min": 0, "max": 100, "decimals": 1,
+     "sim": {"kind": "sine", "min": 10, "max": 90, "period": 20000},
+     "alarms": {"hi": 85, "hihi": 95, "deadband": 1}}
+  ],
+  "triggers": [],
+  "runtime": {"fit": "page", "panZoom": true, "nav": "tabs", "maxRate": 30,
+              "quality": "outline", "theme": "default"}
+}
+```
+
+### Cell binding (`hmiBindings` attribute)
+
+```json
+[{"tag": "Tank1.Level", "target": "style:hmiLevel", "format": {"decimals": 1}}]
+```
+
+### Cell event (`hmiEvents` attribute)
+
+```json
+[{"on": "click", "confirm": true,
+  "actions": [{"type": "toggleTag", "tag": "Pump1.Run"}]}]
+```
+
+### Cell trigger — state machine (`hmiTriggers` attribute)
+
+```json
+[{"name": "PumpAnim", "states": [
+  {"name": "running", "conditions": [{"tag": "Pump1.Run", "operator": "==", "value": true}],
+   "actions": [{"type": "startAnimation", "target": "self", "name": "spin"}]},
+  {"name": "stopped", "conditions": [],
+   "actions": [{"type": "stopAnimation", "target": "self", "name": "spin"}]}
+]}]
+```
+
+### Cell animation (`hmiAnimations` attribute)
+
+```json
+[{"name": "spin", "preset": "spin", "params": {"rpmTag": "Pump1.Speed"}, "autoPlay": true}]
+```
+
+For the complete, authoritative schema (every field, every default) see [ARCHITECTURE.md §2](ARCHITECTURE.md#2-persisted-schemas-json-stored-in-xml-attributes).
